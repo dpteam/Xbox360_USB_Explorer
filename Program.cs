@@ -1457,6 +1457,19 @@ namespace Xbox360_USB_Explorer
         private FatxPartition _compatPart;
         private bool _deviceOpen;
 
+        private FatxPartition _curPart;          // что сейчас показано в правом списке
+        private uint _curCluster;       // кластер текущей папки списка
+        private readonly Stack<Nav> _backStack = new Stack<Nav>();   // история для ".."
+        private TreeNode _syncedTreeNode;   // нода дерева, синхронная со списком
+        private bool _suppressTreeSelect;
+
+        private struct Nav
+        {
+            public FatxPartition Part; public uint Cluster;
+            public Nav(FatxPartition p, uint c) { Part = p; Cluster = c; }
+        }
+        private sealed class UpTag { }           // маркер строки ".."
+
         // Tag helpers
         private sealed class NodeTag
         {
@@ -1491,6 +1504,7 @@ namespace Xbox360_USB_Explorer
             _images.Images.Add("folder", MakeFolderIcon());
             _images.Images.Add("file", MakeFileIcon());
             _images.Images.Add("con", MakeConIcon());
+            _images.Images.Add("up", MakeUpIcon());
 
             // --- Menu ---
             _menu = new MenuStrip();
@@ -1557,6 +1571,9 @@ namespace Xbox360_USB_Explorer
             _ctxList.Items.Add("New Folder…", null, OnTreeNewFolder);
             _list.ContextMenuStrip = _ctxList;
 
+            _list.Activation = ItemActivation.Standard;   // Enter и dbl-click → ItemActivate
+            _list.ItemActivate += OnListActivate;
+
             // --- Split ---
             _split = new SplitContainer();
             _split.Dock = DockStyle.Fill;
@@ -1599,6 +1616,25 @@ namespace Xbox360_USB_Explorer
             }
             return b;
         }
+        private static Bitmap MakeUpIcon()
+        {
+            Bitmap b = new Bitmap(16, 16);
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.Clear(Color.Transparent);
+                g.FillRectangle(Brushes.Khaki, 1, 5, 14, 9);
+                g.FillRectangle(Brushes.Khaki, 1, 3, 6, 3);
+                g.DrawRectangle(Pens.DarkGoldenrod, 1, 5, 13, 8);
+                using (Pen p = new Pen(Color.DarkSlateBlue, 2))
+                {
+                    g.DrawLine(p, 8, 11, 8, 6);          // стрелка вверх
+                    g.DrawLine(p, 8, 6, 5, 9);
+                    g.DrawLine(p, 8, 6, 11, 9);
+                }
+            }
+            return b;
+        }
+
         private static Bitmap MakeFileIcon()
         {
             Bitmap b = new Bitmap(16, 16);
@@ -1743,6 +1779,18 @@ namespace Xbox360_USB_Explorer
                     }
                     catch { _compatPart = null; }
 
+                    // Cache (HDD image) — пробуем, тихо пропускаем если нет
+                    if (fileLen > FatxConst.HDD_CACHE_OFFSET + FatxConst.HEADER_SIZE)
+                    {
+                        try
+                        {
+                            PartitionStream ioC = new PartitionStream(path);
+                            long lenC = Math.Min((long)FatxConst.HDD_CACHE_SIZE, fileLen - FatxConst.HDD_CACHE_OFFSET);
+                            _cachePart = new FatxPartition(ioC, FatxConst.HDD_CACHE_OFFSET, lenC, "Cache (HDD)");
+                        }
+                        catch (Exception ex) { Log.Warn("Cache partition skipped: " + ex.Message); _cachePart = null; }
+                    }
+
                     BuildTree();
                     _deviceOpen = true;
                     _statusLabel.Text = "HDD image opened: " + Path.GetFileName(path);
@@ -1761,7 +1809,6 @@ namespace Xbox360_USB_Explorer
         private void OnOpenRawHdd(object sender, EventArgs e)
         {
             if (_deviceOpen) { Warn("Close current device first."); return; }
-
             if (!Win32Native.IsAdministrator())
             {
                 Log.Warn("Raw HDD access requires Administrator. Elevating…");
@@ -1774,45 +1821,61 @@ namespace Xbox360_USB_Explorer
                 Tui.SetTitle("Scanning for Xbox HDD…");
                 _statusLabel.Text = "Scanning physical drives…";
                 int idx = DeviceDetect.FindXboxHdd();
-                if (idx < 0)
-                {
-                    Warn("No Xbox 360 HDD found.");
-                    return;
-                }
+                if (idx < 0) { Warn("No Xbox 360 HDD found."); return; }
 
-                RawDiskStream rds = new RawDiskStream(idx);
-                long diskLen = rds.Length;
-
-                // --- защита: если DeviceIoControl не вернул размер ---
+                long diskLen = 0;
+                using (RawDiskStream probe = new RawDiskStream(idx)) diskLen = probe.Length;
                 if (diskLen <= FatxConst.HDD_DATA_OFFSET)
+                { Warn("Cannot determine disk size / disk too small."); return; }
+                Log.Info(string.Format("Raw HDD {0}: diskLen=0x{1:X}", idx, diskLen));
+
+                // DATA (обязательный)
+                try
                 {
-                    Log.Warn("Disk size too small or unknown (" + diskLen +
-                             "). Trying fallback size detection…");
-                    // Fallback: читаем размер через FileStream.Length
-                    // (RawDiskStream уже обёрнут в FileStream)
-                    diskLen = rds.Length;
-                    if (diskLen <= FatxConst.HDD_DATA_OFFSET)
-                    {
-                        rds.Dispose();
-                        Warn("Cannot determine disk size. Disk too small or geometry query failed.");
-                        return;
-                    }
+                    PartitionStream io = new PartitionStream(new RawDiskStream(idx));
+                    io.LengthOverride = diskLen;
+                    _dataPart = new FatxPartition(io, FatxConst.HDD_DATA_OFFSET,
+                        diskLen - FatxConst.HDD_DATA_OFFSET, "Data (Raw HDD)");
                 }
+                catch (Exception ex) { Log.Error("Data partition: " + ex.Message); _dataPart = null; }
 
-                PartitionStream io = new PartitionStream(rds);
-                io.LengthOverride = diskLen;
+                // CACHE (пробуем — если региона нет / не FATX, тихо пропускаем)
+                if (diskLen > FatxConst.HDD_CACHE_OFFSET + FatxConst.HEADER_SIZE)
+                {
+                    try
+                    {
+                        PartitionStream io = new PartitionStream(new RawDiskStream(idx));
+                        io.LengthOverride = diskLen;
+                        long len = Math.Min((long)FatxConst.HDD_CACHE_SIZE, diskLen - FatxConst.HDD_CACHE_OFFSET);
+                        _cachePart = new FatxPartition(io, FatxConst.HDD_CACHE_OFFSET, len, "Cache (Raw HDD)");
+                    }
+                    catch (Exception ex) { Log.Warn("Cache partition skipped: " + ex.Message); _cachePart = null; }
+                }
+                else Log.Info("Cache region out of disk range — skipped.");
 
-                long dataLen = diskLen - FatxConst.HDD_DATA_OFFSET;
-                Log.Info(string.Format("Raw HDD {0}: diskLen=0x{1:X}, dataPartLen=0x{2:X}",
-                                       idx, diskLen, dataLen));
+                // COMPAT (пробуем)
+                if (diskLen > FatxConst.HDD_COMPAT_OFFSET + FatxConst.HEADER_SIZE)
+                {
+                    try
+                    {
+                        PartitionStream io = new PartitionStream(new RawDiskStream(idx));
+                        io.LengthOverride = diskLen;
+                        long len = Math.Min((long)FatxConst.HDD_COMPAT_SIZE, diskLen - FatxConst.HDD_COMPAT_OFFSET);
+                        _compatPart = new FatxPartition(io, FatxConst.HDD_COMPAT_OFFSET, len, "Compatibility (Raw HDD)");
+                    }
+                    catch (Exception ex) { Log.Warn("Compat partition skipped: " + ex.Message); _compatPart = null; }
+                }
+                else Log.Info("Compat region out of disk range — skipped.");
 
-                _dataPart = new FatxPartition(io, FatxConst.HDD_DATA_OFFSET, dataLen, "Data (Raw HDD)");
+                if (_dataPart == null && _cachePart == null && _compatPart == null)
+                { Warn("No valid FATX partitions found on this HDD."); return; }
 
                 BuildTree();
                 _deviceOpen = true;
                 _statusLabel.Text = "Raw HDD " + idx + " opened.";
                 Tui.SetTitle("Raw HDD " + idx);
-                Log.Ok("Raw HDD opened.");
+                Log.Ok(string.Format("Raw HDD opened. Partitions: Data={0} Cache={1} Compat={2}",
+                    _dataPart != null, _cachePart != null, _compatPart != null));
             }
             catch (Exception ex)
             {
@@ -1900,18 +1963,137 @@ namespace Xbox360_USB_Explorer
 
         private void OnTreeSelect(object sender, TreeViewEventArgs e)
         {
+            if (_suppressTreeSelect) return;                 // программное выделение — игнор
             TreeNode node = e.Node;
-            if (node == null || node.Tag == null) return;
+            if (node == null) return;
+            NodeTag nt = node.Tag as NodeTag;
+            if (nt == null) return;
 
-            // expand lazy nodes
             if (node.Nodes.Count == 1 && node.Nodes[0].Text == "__loading__")
             {
                 node.Nodes.Clear();
-                NodeTag nt = (NodeTag)node.Tag;
                 LoadSubDirs(node, nt.Partition, nt.Cluster);
             }
 
-            LoadFileList(node);
+            NavigateTo(nt.Partition, nt.Cluster, true);      // клик по дереву = шаг в историю
+            _syncedTreeNode = node;
+        }
+
+        /// <summary>Единая точка загрузки правого списка.</summary>
+        private void NavigateTo(FatxPartition part, uint cluster, bool pushBack)
+        {
+            if (pushBack && _curPart != null)
+                _backStack.Push(new Nav(_curPart, _curCluster));
+            _curPart = part;
+            _curCluster = cluster;
+            LoadListForCurrent();
+        }
+
+        private void LoadListForCurrent()
+        {
+            _list.Items.Clear();
+            if (_curPart == null) return;
+
+            // ".." — только если есть куда возвращаться
+            if (_backStack.Count > 0)
+            {
+                ListViewItem up = new ListViewItem("..", "up");
+                up.Tag = new UpTag();
+                _list.Items.Add(up);
+            }
+
+            try
+            {
+                List<FatxDirent> entries = _curPart.ReadDirectory(_curCluster);
+                foreach (FatxDirent e in entries)
+                {
+                    if (!e.IsValid) continue;
+                    string icon = e.IsDirectory ? "folder" : DetectFileType(_curPart, e);
+                    ListViewItem lvi = new ListViewItem(e.Name, icon);
+                    lvi.SubItems.Add(e.IsDirectory ? "<DIR>" : ConsoleProgress.FormatSize(e.FileSize));
+                    lvi.SubItems.Add(e.IsDirectory ? "Directory" : Path.GetExtension(e.Name).ToUpper().TrimStart('.'));
+                    DateTime mt = e.GetLastWriteDate();
+                    lvi.SubItems.Add(mt == DateTime.MinValue ? "" : mt.ToString("yyyy-MM-dd HH:mm"));
+                    lvi.Tag = new ItemTag(e, _curPart);
+                    _list.Items.Add(lvi);
+                }
+                _statusLabel.Text = _curPart.Label + " — " + entries.Count + " entries";
+            }
+            catch (Exception ex)
+            {
+                Log.Error("LoadListForCurrent: " + ex.Message);
+                _statusLabel.Text = "Error reading directory.";
+            }
+        }
+
+        /// <summary>Двойной клик / Enter по правому списку.</summary>
+        private void OnListActivate(object sender, EventArgs e)
+        {
+            if (_list.SelectedItems.Count == 0) return;
+            ListViewItem lvi = _list.SelectedItems[0];
+
+            if (lvi.Tag is UpTag) { GoUp(); return; }
+
+            ItemTag tag = lvi.Tag as ItemTag;
+            if (tag == null || !tag.Dirent.IsDirectory) return;   // файл — не открываем
+
+            // best-effort синхронизация дерева: ищем дочернюю ноду текущей выделенной
+            TreeNode target = null;
+            NodeTag snt = _syncedTreeNode != null ? _syncedTreeNode.Tag as NodeTag : null;
+            if (snt != null && snt.Cluster == _curCluster && snt.Partition == _curPart)
+            {
+                EnsureChildrenLoaded(_syncedTreeNode);
+                foreach (TreeNode c in _syncedTreeNode.Nodes)
+                {
+                    NodeTag ct = c.Tag as NodeTag;
+                    if (ct != null && ct.Cluster == tag.Dirent.FirstCluster) { target = c; break; }
+                }
+            }
+
+            NavigateTo(tag.Partition, tag.Dirent.FirstCluster, true);
+
+            _syncedTreeNode = target;
+            if (target != null)
+            {
+                _suppressTreeSelect = true;
+                try { target.Expand(); _tree.SelectedNode = target; target.EnsureVisible(); }
+                finally { _suppressTreeSelect = false; }
+            }
+        }
+
+        /// <summary>".." / Back.</summary>
+        private void GoUp()
+        {
+            if (_backStack.Count == 0) return;
+            Nav prev = _backStack.Pop();
+            _curPart = prev.Part;
+            _curCluster = prev.Cluster;
+            LoadListForCurrent();
+
+            if (_syncedTreeNode != null && _syncedTreeNode.Parent != null)
+            {
+                NodeTag pnt = _syncedTreeNode.Parent.Tag as NodeTag;
+                if (pnt != null && pnt.Cluster == prev.Cluster && pnt.Partition == prev.Part)
+                {
+                    _syncedTreeNode = _syncedTreeNode.Parent;
+                    _suppressTreeSelect = true;
+                    try { _tree.SelectedNode = _syncedTreeNode; _syncedTreeNode.EnsureVisible(); }
+                    finally { _suppressTreeSelect = false; }
+                }
+                else _syncedTreeNode = null;
+            }
+            else _syncedTreeNode = null;
+        }
+
+        private void EnsureChildrenLoaded(TreeNode node)
+        {
+            NodeTag nt = node.Tag as NodeTag;
+            if (nt == null) return;
+            if (node.Nodes.Count == 1 && node.Nodes[0].Text == "__loading__")
+            {
+                node.Nodes.Clear();
+                LoadSubDirs(node, nt.Partition, nt.Cluster);
+            }
         }
 
         private void LoadFileList(TreeNode node)
@@ -2269,15 +2451,14 @@ namespace Xbox360_USB_Explorer
         private void RefreshCurrentNode()
         {
             TreeNode node = _tree.SelectedNode;
-            if (node == null) return;
-            // reload children
+            if (node == null || node.Tag == null) return;
+            NodeTag nt = (NodeTag)node.Tag;
+
             node.Nodes.Clear();
-            if (node.Tag != null)
-            {
-                NodeTag nt = (NodeTag)node.Tag;
-                LoadSubDirs(node, nt.Partition, nt.Cluster);
-                LoadFileList(node);
-            }
+            LoadSubDirs(node, nt.Partition, nt.Cluster);
+
+            NavigateTo(nt.Partition, nt.Cluster, false);   // без записи в историю
+            _syncedTreeNode = node;
         }
 
         private void Warn(string msg)
