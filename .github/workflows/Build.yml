@@ -30,4 +30,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Xbox360_USB_Explorer
-          path: Xbox360_USB_Explorer/bin/Release/
+          path: Xbox360_USB_Explorer/bin/Release/net48/
